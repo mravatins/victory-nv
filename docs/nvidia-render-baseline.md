@@ -64,3 +64,18 @@ The steady window in `bench-fxceless_nv_baseline_warm.log` from
 frame. The earlier `run-nv-x-windows2.log` benchmark returned 111.1 ms
 per frame (9.0 fps) across eight similarly sized reports. The runs used
 different renderer settings, so this comparison does not isolate a speedup.
+
+## Verification
+
+The baseline was rebuilt as a standard release. The reference executable in
+`bench-fxceless` includes the diagnostics feature, which is another difference
+when comparing those runs.
+
+Commit `3b4169bc` preserves scalar work on far-jump exit paths. The existing
+Wave64 tests passed after the fix. The nine compute shaders checked from the
+prologue trace emitted identical DXIL before and after the fix.
+
+The shader suite passed 222 tests after excluding two LDS floating-point
+atomic tests following a stalled run. The GPU suite passed 184 tests after
+excluding the indirect-budget test, which still fails intermittently
+when separate workgroups compete for the same budget.
