@@ -2224,6 +2224,14 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &self.x.native.io
+            && self.s.pixel
+            && super::early_depth(*db_shader_control)
+        {
+            self.s.flags |= flags::EARLY_DEPTH;
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);

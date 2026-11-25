@@ -74,6 +74,9 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    /// `[earlydepthstencil]`: depth and stencil are tested before the
+    /// shader runs, so a fragment that fails them writes no UAV.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;

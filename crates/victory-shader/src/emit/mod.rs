@@ -217,6 +217,54 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
+/// Whether a pixel shader whose console `DB_SHADER_CONTROL` is `db` runs
+/// after the depth and stencil tests (`ShaderFlags.ForceEarlyDepthStencil`).
+///
+/// D3D12 tests depth after a pixel shader that writes UAVs unless the
+/// shader says otherwise, so such a shader's writes land for fragments the
+/// depth test then rejects. The console's own compiler marks
+/// `[earlydepthstencil]` in the register instead (DEPTH_BEFORE_SHADER, bit
+/// 12): without it here, the prison fence (a transparent pass that writes
+/// its colour through a UAV) was drawn over the hair in front of it.
+///
+/// `VICTORY_EARLY_Z`: `0` never; unset or `1` when DEPTH_BEFORE_SHADER is
+/// set; `2` also when Z_ORDER (bits 4..5) asks for an early test and the
+/// shader neither kills (bit 6) nor exports depth, stencil, coverage or a
+/// mask (bits 0..2, 7, 8), as the hardware then tests early itself.
+pub(crate) fn early_depth(db: u32) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        std::env::var("VICTORY_EARLY_Z").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+    });
+    let early = early_depth_in(mode, db);
+    #[cfg(feature = "diagnostics")]
+    {
+        // Each register value once, to tell which forms the title uses.
+        static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&db) {
+            seen.push(db);
+            eprintln!("pixel shader DB_SHADER_CONTROL {db:#x}: early depth {early} (VICTORY_EARLY_Z={mode})");
+        }
+    }
+    early
+}
+
+/// [`early_depth`] for a given `VICTORY_EARLY_Z` mode. Pure, for testing.
+fn early_depth_in(mode: u8, db: u32) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS_OR_KILL: u32 = 0b111 | 1 << 6 | 1 << 7 | 1 << 8;
+    let z_order = (db >> 4) & 3;
+    match mode {
+        0 => false,
+        1 => db & DEPTH_BEFORE_SHADER != 0,
+        _ => {
+            db & DEPTH_BEFORE_SHADER != 0
+                || (matches!(z_order, 1 | 3) && db & EXPORTS_OR_KILL == 0)
+        }
+    }
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -804,6 +852,22 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn early_depth_follows_the_console_register() {
+        use super::early_depth_in;
+        let before = 1 << 12;
+        let early_z = 1 << 4;
+        let kill = 1 << 6;
+        assert!(!early_depth_in(0, before));
+        assert!(early_depth_in(1, before));
+        assert!(!early_depth_in(1, early_z));
+        assert!(early_depth_in(2, early_z));
+        assert!(!early_depth_in(2, early_z | kill));
+        assert!(!early_depth_in(2, early_z | 1)); // depth export
+        assert!(!early_depth_in(2, 0)); // late Z
+        assert!(early_depth_in(2, before | kill));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
