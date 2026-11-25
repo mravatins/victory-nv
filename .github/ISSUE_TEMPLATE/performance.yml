@@ -1,0 +1,23 @@
+name: Performance report
+description: Frame-time measurements or a bottleneck you found
+labels: [performance]
+body:
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Measurements
+      description: Output of scripts/bench/measure.ps1 (JSON), or the frame lines from the log.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and driver
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Analysis
+      description: What you think the bottleneck is and why.
