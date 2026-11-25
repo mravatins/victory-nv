@@ -388,7 +388,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u128), u32, std::hash::BuildHasherDefault<Quick>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -1181,7 +1181,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A root signature holds at most 64 dwords: on the stack,
+                // not an allocation per stage of every draw.
+                let mut stack = [0u32; 64];
+                let mut spill = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    spill.resize(dwords as usize, 0);
+                    &mut spill
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -2743,15 +2752,25 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            // Two independent 64-bit mixes (a 128-bit key): a collision
+            // would bind another table's descriptors, and SipHash over
+            // every record of some 15,000 tables a frame was slow.
             let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let (mut a, mut b) = (0x243F_6A88_85A3_08D3u64, 0x1319_8A2E_0370_7344u64);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let [w0, w1, w2] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    let lo = u64::from(w0) | (u64::from(w1) << 32);
+                    let hi = u64::from(w2) | (u64::from(k) << 32);
+                    a = (a ^ lo).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29) ^ hi;
+                    a = a.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    b = (b ^ hi).wrapping_mul(0x94D0_49BB_1331_11EB).rotate_left(31) ^ lo;
+                    b = b.wrapping_mul(0xD6E8_FEB8_6659_FD93);
                 }
-                (table, n, h.finish())
+                a ^= a >> 32;
+                b ^= b >> 29;
+                (table, n, (u128::from(a) << 64) | u128::from(b))
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -3759,5 +3778,38 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+}
+
+/// A quick hasher for keys that are already well mixed (`State::fresh_tables`).
+#[derive(Default)]
+pub(crate) struct Quick(u64);
+
+impl std::hash::Hasher for Quick {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7cc1_b727_220a_95);
+    }
+
+    fn write_u128(&mut self, n: u128) {
+        self.write_u64(n as u64);
+        self.write_u64((n >> 64) as u64);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
     }
 }
