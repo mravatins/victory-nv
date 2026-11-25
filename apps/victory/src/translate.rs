@@ -152,6 +152,87 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// `translate --warm <file>`: the containers whose hash the file names are
+/// translated into the run's shader cache, on `jobs` threads; nothing is
+/// made on the GPU. A run of the title then finds them there instead of
+/// translating each at its first use.
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+    // `--warm all`: every container found, whatever its hash.
+    let all = file.as_os_str() == "all";
+    let mut wanted: HashSet<String> = HashSet::new();
+    if !all {
+        let text = std::fs::read_to_string(file)?;
+        for line in text.lines() {
+            for word in line.split(|c: char| !c.is_ascii_hexdigit()) {
+                if word.len() == 16 {
+                    wanted.insert(word.to_ascii_lowercase());
+                }
+            }
+        }
+        anyhow::ensure!(!wanted.is_empty(), "no 16-digit shader hash in {}", file.display());
+    }
+    // `VICTORY_WARM_SECONDS=<n>`: stop taking new shaders after n seconds
+    // (what is done stays in the cache; the next warm-up goes on from there).
+    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let paths = crate::default_paths(paths)?;
+    let threads = jobs.unwrap_or(4).max(1);
+    let began = std::time::Instant::now();
+    let done = Mutex::new(HashSet::new());
+    let counts = [const { AtomicUsize::new(0) }; 5];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else {
+                                continue;
+                            };
+                            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            if (!all && !wanted.contains(&hash)) || !lock(&done).insert(hash) {
+                                continue;
+                            }
+                            let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(1000) {
+                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                            }
+                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                                Ok(true) => 0,
+                                Ok(false) => 1,
+                                Err(_) => 2,
+                            };
+                            counts[which].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+        }
+    }
+    let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
+    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
+    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
+    println!(
+        "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
+        translated + there + failed,
+        began.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -303,78 +384,6 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    Ok(())
-}
-
-/// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
-    let paths = crate::default_paths(paths)?;
-    let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-    let seen = Mutex::new(HashSet::new());
-    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
-    let started = std::time::Instant::now();
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let Ok(container) = Container::parse(&bytes) else { continue };
-                            // As the title passes it: no more than the container.
-                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
-                            let total = u32::from_le_bytes(total) as usize;
-                            let bytes = &bytes[..total.min(bytes.len())];
-                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
-                            if !lock(&seen).insert(blake3::hash(bytes)) {
-                                continue;
-                            }
-                            let Ok(programs) = native_programs(dxil) else { continue };
-                            let stage = programs.iter().find_map(|p| match p.stage {
-                                HwStage::Vs => Some("vertex"),
-                                HwStage::Ps => Some("pixel"),
-                                HwStage::Ms => Some("mesh"),
-                                HwStage::Cs => Some("compute"),
-                                _ => None,
-                            });
-                            let Some(stage) = stage else { continue };
-                            let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
-                            let count = if translated { &done } else { &refused };
-                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
-                            match pipeline {
-                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
-                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
-                                None => 0,
-                            };
-                            if n.is_multiple_of(2000) {
-                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
-                            }
-                        }
-                    });
-                }
-            });
-        }
-    }
-    victory_hle::modules::d3d12x::save_pipeline_cache();
-    println!(
-        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
-        done.into_inner(),
-        refused.into_inner(),
-        made.into_inner(),
-        unmade.into_inner(),
-        started.elapsed().as_secs_f64()
-    );
     Ok(())
 }
 

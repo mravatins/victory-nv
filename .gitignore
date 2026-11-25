@@ -7,9 +7,8 @@
 # See docs/asset-policy.md.
 # ---------------------------------------------------------------------------
 
-# Build output (one target dir per build while a running exe locks another)
+# Build output
 /target/
-/target-*/
 /tests/fixtures/*/target/
 
 # Local configuration (contains paths to YOUR files)
@@ -77,9 +76,3 @@
 *.swp
 Thumbs.db
 .DS_Store
-
-# Local tool state
-/.claude/
-*.log
-# Local working notes
-/NV-PERF-STATUS.md

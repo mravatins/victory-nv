@@ -58,7 +58,7 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -1144,11 +1144,13 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1160,7 +1162,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            #[cfg(not(feature = "diagnostics"))]
+            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1193,77 +1198,43 @@ mod host {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct ScriptedKey {
-        at: Duration,
-        until: Duration,
-        vk: u8,
-    }
-
-    fn parse_scripted_key(entry: &str) -> Option<ScriptedKey> {
-        let (at, rest) = entry.split_once(':')?;
-        let at = Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?;
-        let (key, hold) = match rest.split_once(':') {
-            Some((key, hold)) => (
-                key,
-                Duration::try_from_secs_f64(hold.trim().parse().ok()?).ok()?,
-            ),
-            None => (rest, Duration::from_millis(200)),
-        };
-        if hold.is_zero() {
-            return None;
-        }
-        let vk = match key.trim() {
-            "Enter" => 0x0D,
-            "Esc" => 0x1B,
-            "Tab" => 0x09,
-            "Back" => 0x08,
-            "Up" => 0x26,
-            "Down" => 0x28,
-            "Left" => 0x25,
-            "Right" => 0x27,
-            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                k.as_bytes()[0].to_ascii_uppercase()
-            }
-            _ => return None,
-        };
-        Some(ScriptedKey { at, until: at.checked_add(hold)?, vk })
-    }
-
-    /// `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` plays keys after input
-    /// starts, with or without focus. The default hold is 0.2 seconds. A key is a
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+    /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<Option<(Instant, Vec<ScriptedKey>)>> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").ok()?;
-            let keys: Vec<_> = list.split(',').filter_map(parse_scripted_key).collect();
-            if keys.is_empty() {
-                return None;
-            }
-            tracing::info!(entries = keys.len(), "scripted game input enabled");
-            Some((Instant::now(), keys))
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            let keys = list.split(',').filter_map(|entry| {
+                let (at, key) = entry.split_once(':')?;
+                let vk = match key.trim() {
+                    "Enter" => 0x0D,
+                    "Esc" => 0x1B,
+                    "Tab" => 0x09,
+                    "Back" => 0x08,
+                    "Up" => 0x26,
+                    "Down" => 0x28,
+                    "Left" => 0x25,
+                    "Right" => 0x27,
+                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                        k.as_bytes()[0].to_ascii_uppercase()
+                    }
+                    _ => return None,
+                };
+                Some((
+                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    vk,
+                ))
+            });
+            (Instant::now(), keys.collect())
         });
-        let Some((start, keys)) = SCRIPT.as_ref() else { return Vec::new() };
+        let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|key| (key.at..key.until).contains(&now))
-            .map(|key| key.vk)
+            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .map(|&(_, vk)| vk)
             .collect()
-    }
-
-    #[test]
-    fn scripted_input_accepts_default_taps_and_explicit_holds() {
-        let tap = parse_scripted_key("2:Enter").unwrap();
-        assert_eq!(tap.at, Duration::from_secs(2));
-        assert_eq!(tap.until, Duration::from_millis(2200));
-        assert_eq!(tap.vk, 0x0D);
-
-        let hold = parse_scripted_key("3:Enter:4.5").unwrap();
-        assert_eq!(hold.until, Duration::from_millis(7500));
-        assert_eq!(hold.vk, tap.vk);
-        assert!(parse_scripted_key("3:Enter:0").is_none());
-        assert!(parse_scripted_key("3:Enter:NaN").is_none());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
